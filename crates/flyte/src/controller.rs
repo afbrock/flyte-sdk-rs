@@ -97,6 +97,8 @@ impl Controller {
     /// Auth from `_UNION_EAGER_API_KEY`. Must be called from a non-async thread:
     /// the underlying constructor blocks on the shared runtime.
     pub fn with_auth(run_id: RunIdentifier, workers: usize) -> Result<Self, Error> {
+        // flyte_core builds the shared runtime on first use; configure it first.
+        runtime();
         let inner = CoreBaseController::new_with_auth(workers)
             .map_err(|e| Error::Controller(format!("controller init (auth) failed: {e:?}")))?;
         Ok(Controller { inner, run_id })
@@ -108,6 +110,8 @@ impl Controller {
         endpoint: String,
         workers: usize,
     ) -> Result<Self, Error> {
+        // flyte_core builds the shared runtime on first use; configure it first.
+        runtime();
         let inner = CoreBaseController::new_without_auth(endpoint, workers)
             .map_err(|e| Error::Controller(format!("controller init failed: {e:?}")))?;
         Ok(Controller { inner, run_id })
@@ -370,6 +374,48 @@ impl Controller {
 
 /// The shared tokio runtime the controller's background workers run on. All SDK
 /// async work must run on this runtime (worker_main / run block on it).
+///
+/// Its threads get [`WORKER_STACK`] rather than tokio's 2 MiB. A one-shot task
+/// is polled on the main thread (8 MiB), but a reusable container polls every
+/// action on a worker, so the same task gets a quarter of the stack there. C
+/// code reached from it (TLS, compression) can step over the single guard
+/// page of a thread that is nearly full, and that is a bare SIGSEGV, not
+/// Rust's "overflowed its stack" abort. `RUST_MIN_STACK`, when set, wins.
 pub fn runtime() -> &'static tokio::runtime::Runtime {
+    static CONFIGURE: std::sync::Once = std::sync::Once::new();
+    CONFIGURE.call_once(|| {
+        let mut builder = tokio::runtime::Builder::new_multi_thread();
+        builder.enable_all();
+        if std::env::var_os("RUST_MIN_STACK").is_none() {
+            builder.thread_stack_size(WORKER_STACK);
+        }
+        pyo3_async_runtimes::tokio::init(builder);
+    });
     pyo3_async_runtimes::tokio::get_runtime()
+}
+
+/// The main thread's default stack on Linux.
+pub const WORKER_STACK: usize = 8 * 1024 * 1024;
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn runtime_workers_get_the_main_thread_stack() {
+        // ~3 MiB of frames: past tokio's 2 MiB default, within WORKER_STACK.
+        #[inline(never)]
+        fn deep(n: usize) -> u8 {
+            let buf = std::hint::black_box([n as u8; 64 * 1024]);
+            if n == 0 {
+                buf[0]
+            } else {
+                deep(n - 1).wrapping_add(buf[1])
+            }
+        }
+        if std::env::var_os("RUST_MIN_STACK").is_some() {
+            return;
+        }
+        let r =
+            super::runtime().block_on(async { tokio::spawn(async { deep(48) }).await.unwrap() });
+        let _ = r;
+    }
 }

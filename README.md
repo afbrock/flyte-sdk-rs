@@ -268,6 +268,12 @@ adds the second name a pool replica is launched under, so this needs no docker o
 your machine. Worked example, including a non-reusable Python parent fanning out
 to a reusable Rust child: [`examples/reusable`](examples/reusable).
 
+That second name is `unionai-actor-bridge`, and it must be the first one on
+PATH. An image that also installs the `union` Python package (or
+`flyteplugins-union`) gets Union's own Python bridge in its environment's `bin`,
+which usually comes first. Replicas then run that one instead, and die with exit
+code 139 and no task log. Point the name at the Rust binary in that `bin` too.
+
 ## Working on the SDK
 
 ```bash

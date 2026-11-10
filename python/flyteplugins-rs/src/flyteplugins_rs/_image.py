@@ -14,6 +14,7 @@ task puts the binary path in `args[0]`; and the remote builder ignores
 from __future__ import annotations
 
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -88,6 +89,14 @@ _DOCKERFILE_CONTRACT = """A worker Dockerfile has to satisfy three things (four 
    `RUN ln -sf /usr/local/bin/<binary> /usr/local/bin/unionai-actor-bridge`.
    Without it the replica exits before it can report why, and the pool shows up
    as CrashLoopBackOff with no task ever running.
+   It has to be the **first** `unionai-actor-bridge` on PATH. The `union` Python
+   package (and `flyteplugins-union`) installs Union's own, Python-only bridge
+   into its environment's `bin`, typically `/opt/venv/bin`, ahead of
+   `/usr/local/bin`. That one accepts the action, cannot run a Rust command, and
+   the replica dies (exit 139) with nothing in the task log. If the image
+   installs either package, point that name at the binary too, e.g.
+   `RUN ln -sf /usr/local/bin/<binary> "$(dirname "$(command -v python)")/unionai-actor-bridge"`,
+   and check with `readlink -f "$(command -v unionai-actor-bridge)"`.
 1. **The binary lands at `/usr/local/bin/<binary>`.** The task passes that path
    as `args[0]`, so it is the one hard-coded contract between image and task.
 2. **The image can run it.** `flyte_core` enables `pyo3/auto-initialize`, so the
@@ -121,6 +130,13 @@ successful build and push). Either make the package public once, or point
 """
 
 
+# `union` or `flyteplugins-union` as a pip/uv requirement, which installs Union's
+# Python actor bridge.
+_PYTHON_BRIDGE = re.compile(
+    r"(?<![\w.-])(union|flyteplugins-union)(?![\w.-])(\[[^\]]*\])?([<>=!~ ;,\x22']|$)", re.MULTILINE
+)
+
+
 def _dockerfile_image(
     *,
     dockerfile: Path,
@@ -142,6 +158,15 @@ def _dockerfile_image(
             f"declares reuse=. The fasttask plugin launches replicas with that command, "
             f"so the image must provide it:\n"
             f"    RUN ln -sf /usr/local/bin/{binary} /usr/local/bin/unionai-actor-bridge",
+            file=sys.stderr,
+        )
+    elif reuse and _PYTHON_BRIDGE.search(dockerfile.read_text()):
+        print(
+            f"warning: {dockerfile} installs the union Python package, which ships its "
+            f"own unionai-actor-bridge in the Python environment's bin -- usually ahead "
+            f"of /usr/local/bin on PATH. Replicas would run that one, which cannot run "
+            f"{binary}, and die with exit 139 and no task log. After the pip install:\n"
+            f'    RUN ln -sf /usr/local/bin/{binary} "$(dirname "$(command -v python)")/unionai-actor-bridge"',
             file=sys.stderr,
         )
     if registry is None:

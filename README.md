@@ -129,6 +129,18 @@ so it needs no deploy of its own. `inputs!` names the callee's inputs and
 checks them against its interface. Retries and the short name can be
 overridden per call (`SQUARE.with_retries(3)`).
 
+A task that is already deployed can be called without bundling it, by asking
+for it explicitly. It is fetched from the backend on the first call:
+
+```rust
+static SQUARE: flyte::TaskRef =
+    flyte::TaskRef::remote("fanout_py.square", flyte::TaskVersion::Latest);
+```
+
+`TaskVersion` is `Exact("...")`, `Latest`, or `Current` (the caller's own
+version), as in Python's `flyte.remote.Task.get`. `TaskRef::new` never falls
+back to this: a name missing from `calls=` is an error.
+
 Calls behave like the Python SDK's:
 
 - **Names:** each call is named from its inputs and its order among identical
@@ -140,8 +152,7 @@ Calls behave like the Python SDK's:
 
 With no backend, under `flyte::run`, a call runs the `flyte::stub_task`
 registered for its name. Full example: [`examples/fanout`](examples/fanout).
-The design, including fetching deployed tasks and defining callees in Rust, is
-in [`docs/design/task-fanout.md`](docs/design/task-fanout.md).
+The design, including defining callees in Rust, is in [`docs/design/task-fanout.md`](docs/design/task-fanout.md).
 
 ## Install
 

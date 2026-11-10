@@ -10,11 +10,11 @@
 //! The one thing Rust cannot build for itself is the child's `TaskSpec` (image,
 //! args, resources, cache config...). Where it comes from is a [`SpecSource`]
 //! held by the [`TaskRef`], resolved when the call is made -- never something a
-//! call site spells out. Today a spec comes either from the bundle the Python
-//! launcher hands the worker at deploy time (`rust_task(calls=[...])`), or from
-//! serialized bytes the caller supplies. Fetching a deployed task by reference
-//! or defining it natively in Rust are further sources, added without touching
-//! any `call_task` call site.
+//! call site spells out. A spec comes from the bundle the Python launcher hands
+//! the worker at deploy time (`rust_task(calls=[...])`), from the backend for a
+//! task asked for with [`TaskRef::remote`], or from serialized bytes the caller
+//! supplies. Defining a task natively in Rust is a further source, added
+//! without touching any `call_task` call site.
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -27,6 +27,7 @@ use crate::context::{self, RuntimeState};
 use crate::controller::{Controller, StartedTask, TaskFailure, TaskRecord, TaskResult};
 use crate::error::Error;
 use crate::hash;
+use crate::idl::TaskIdentifier;
 use crate::idl::{
     ActionPhase, Inputs, Literal, NamedLiteral, Outputs, RetryStrategy, RunIdentifier, TaskSpec,
 };
@@ -58,6 +59,35 @@ pub enum SpecSource {
     Named(Cow<'static, str>),
     /// A spec supplied directly, already decoded.
     Inline(Arc<ResolvedSpec>),
+    /// A task already deployed to the backend, fetched when it is first
+    /// called -- see [`TaskRef::remote`].
+    Remote(RemoteTask),
+}
+
+/// A deployed task, as [`SpecSource::Remote`] names it.
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub struct RemoteTask {
+    /// The name the task was deployed under (its `id.name`).
+    pub name: Cow<'static, str>,
+    /// `None`: the calling run's.
+    pub project: Option<Cow<'static, str>>,
+    /// `None`: the calling run's.
+    pub domain: Option<Cow<'static, str>>,
+    pub version: TaskVersion,
+}
+
+/// Which version of a deployed task [`TaskRef::remote`] calls -- Python's
+/// `version=` / `auto_version=` on `flyte.remote.Task.get`.
+#[derive(Clone, Debug)]
+pub enum TaskVersion {
+    Exact(Cow<'static, str>),
+    /// The calling task's own version (its `--version`): for environments that
+    /// are always deployed together, under one version.
+    Current,
+    /// The most recently created version, looked up on the first call and then
+    /// kept for the life of the process, so one run never mixes versions.
+    Latest,
 }
 
 /// Python's `task.override(...)`: per-call changes that do not alter the task's
@@ -101,6 +131,51 @@ impl TaskRef {
         ))))
     }
 
+    /// A task already deployed to the backend, fetched by name when it is first
+    /// called -- Python's `flyte.remote.Task.get(name, version=...)`. It
+    /// runs in the calling run's project and domain unless
+    /// [`Self::in_project`] says otherwise. The fetched spec is cached for the
+    /// life of the process.
+    ///
+    /// This is the only way a call reaches the backend for its spec: a
+    /// [`Self::new`] name missing from the deployed bundle is an error, never
+    /// a silent fetch of whatever happens to be deployed under that name.
+    ///
+    /// Inputs are hashed in the order the fetched interface lists them, as
+    /// Python's `_submit_task_ref` does, so a Rust and a Python parent calling
+    /// the same reference name the call the same way.
+    ///
+    /// ```ignore
+    /// static SQUARE: flyte::TaskRef =
+    ///     flyte::TaskRef::remote("fanout_py.square", flyte::TaskVersion::Latest);
+    /// ```
+    pub const fn remote(name: &'static str, version: TaskVersion) -> Self {
+        TaskRef {
+            source: SpecSource::Remote(RemoteTask {
+                name: Cow::Borrowed(name),
+                project: None,
+                domain: None,
+                version,
+            }),
+            overrides: Overrides {
+                retries: None,
+                short_name: None,
+            },
+        }
+    }
+
+    /// Look a [`Self::remote`] task up in another project and domain. Has no
+    /// effect on any other kind of `TaskRef`, whose spec already says where it
+    /// runs.
+    pub fn in_project(&self, project: impl Into<String>, domain: impl Into<String>) -> Self {
+        let mut t = self.clone();
+        if let SpecSource::Remote(r) = &mut t.source {
+            r.project = Some(Cow::Owned(project.into()));
+            r.domain = Some(Cow::Owned(domain.into()));
+        }
+        t
+    }
+
     pub fn from_source(source: SpecSource) -> Self {
         TaskRef {
             source,
@@ -127,10 +202,22 @@ impl TaskRef {
         t
     }
 
-    fn resolve(&self) -> Result<Arc<ResolvedSpec>, Error> {
+    async fn resolve(&self, controller: &Controller) -> Result<Arc<ResolvedSpec>, Error> {
+        match &self.source {
+            SpecSource::Remote(task) => fetch_remote(task, controller).await,
+            _ => self.resolve_local(),
+        }
+    }
+
+    /// [`Self::resolve`] for the sources that need no backend.
+    fn resolve_local(&self) -> Result<Arc<ResolvedSpec>, Error> {
         match &self.source {
             SpecSource::Inline(spec) => Ok(spec.clone()),
             SpecSource::Named(name) => lookup_spec(name),
+            SpecSource::Remote(task) => Err(Error::System(format!(
+                "task {} is fetched from the backend",
+                task.name
+            ))),
         }
     }
 
@@ -138,6 +225,7 @@ impl TaskRef {
         match &self.source {
             SpecSource::Named(name) => name,
             SpecSource::Inline(spec) => spec.name(),
+            SpecSource::Remote(task) => &task.name,
         }
     }
 }
@@ -350,8 +438,99 @@ fn lookup_spec(name: &str) -> Result<Arc<ResolvedSpec>, Error> {
     known.sort();
     Err(Error::System(format!(
         "task {name:?} is not callable from this worker: no spec was deployed with it \
-         (declare it in the launcher with rust_task(calls=[...])). Callable tasks: {known:?}"
+         (declare it in the launcher with rust_task(calls=[...]), or call a deployed task \
+         with TaskRef::remote). Callable tasks: {known:?}"
     )))
+}
+
+// ---------------------------------------------------------------------------
+// Deployed tasks, fetched from the backend.
+
+/// The calling task's version, from the worker's `--version`.
+static CURRENT_VERSION: RwLock<Option<String>> = RwLock::new(None);
+
+/// Record the running task's version for [`TaskVersion::Current`]. The worker
+/// does this for the `--version` argument.
+#[doc(hidden)]
+pub fn set_current_version(version: String) {
+    *CURRENT_VERSION.write().expect("version poisoned") = Some(version);
+}
+
+/// org, project, domain, name, and the version asked for (`None`: latest).
+type RemoteKey = (String, String, String, String, Option<String>);
+type RemoteCell = Arc<tokio::sync::OnceCell<Arc<ResolvedSpec>>>;
+
+/// One cell per task asked for, so concurrent first calls share one fetch. A
+/// failed fetch leaves its cell empty, and the next call tries again.
+static REMOTE: LazyLock<std::sync::Mutex<HashMap<RemoteKey, RemoteCell>>> =
+    LazyLock::new(Default::default);
+
+async fn fetch_remote(
+    task: &RemoteTask,
+    controller: &Controller,
+) -> Result<Arc<ResolvedSpec>, Error> {
+    let run = controller.run_id();
+    let project = task.project.as_deref().unwrap_or(&run.project).to_string();
+    let domain = task.domain.as_deref().unwrap_or(&run.domain).to_string();
+    let version = match &task.version {
+        TaskVersion::Exact(v) => Some(v.to_string()),
+        TaskVersion::Current => Some(
+            CURRENT_VERSION
+                .read()
+                .expect("version poisoned")
+                .clone()
+                .ok_or_else(|| {
+                    Error::System(format!(
+                        "task {}: TaskVersion::Current needs the worker's --version, \
+                         and this worker was started without one",
+                        task.name
+                    ))
+                })?,
+        ),
+        TaskVersion::Latest => None,
+    };
+    let key = (
+        run.org.clone(),
+        project,
+        domain,
+        task.name.to_string(),
+        version,
+    );
+    let cell = REMOTE
+        .lock()
+        .expect("remote task cache poisoned")
+        .entry(key.clone())
+        .or_default()
+        .clone();
+    let (org, project, domain, name, version) = key;
+    let not_found = |what: String| Error::User {
+        code: "RemoteTaskNotFoundError".into(),
+        message: format!("{what} not found in project {project}, domain {domain}"),
+    };
+    cell.get_or_try_init(|| async {
+        let version = match version {
+            Some(v) => v,
+            None => controller
+                .latest_task_version(&org, &project, &domain, &name)
+                .await?
+                .ok_or_else(|| not_found(format!("no version of task {name}")))?,
+        };
+        let id = TaskIdentifier {
+            org: org.clone(),
+            project: project.clone(),
+            domain: domain.clone(),
+            name: name.clone(),
+            version: version.clone(),
+        };
+        let bytes = controller
+            .deployed_task_spec(id)
+            .await?
+            .ok_or_else(|| not_found(format!("task {name}, version {version},")))?;
+        tracing::info!(task = %name, %version, "fetched deployed task");
+        Ok(Arc::new(ResolvedSpec::decode(&bytes, None)?))
+    })
+    .await
+    .cloned()
 }
 
 // ---------------------------------------------------------------------------
@@ -543,7 +722,7 @@ pub async fn call_task<O: TaskOutput>(task: &TaskRef, inputs: TaskInputs) -> Res
     let Some(state) = context::current() else {
         return O::from_outputs(call_stub(task.display_name(), inputs).await?);
     };
-    let resolved = task.resolve()?;
+    let resolved = task.resolve(&state.controller).await?;
     let name = resolved.name().to_string();
     let inputs = inputs.into_inputs(&name, &resolved)?;
     let outputs = launch(&state, task, &resolved, inputs).await?;
@@ -1056,7 +1235,11 @@ mod tests {
         let bundle =
             b64.encode(serde_json::to_vec(&serde_json::json!({"v": 1, "tasks": entries})).unwrap());
         assert_eq!(register_spec_bundle(&bundle).unwrap(), 7);
-        let resolve = |n: &str| TaskRef::named(n).resolve().map(|s| s.name().to_string());
+        let resolve = |n: &str| {
+            TaskRef::named(n)
+                .resolve_local()
+                .map(|s| s.name().to_string())
+        };
         assert_eq!(resolve("rs-step.step_rs").unwrap(), "step_rs");
         assert_eq!(resolve("step_rs").unwrap(), "step_rs");
         assert_eq!(resolve("rs-other.dup_rs").unwrap(), "dup_rs");
@@ -1066,11 +1249,14 @@ mod tests {
             "{err}"
         );
         assert_eq!(
-            TaskRef::new("golden_env.lint").resolve().unwrap().name(),
+            TaskRef::new("golden_env.lint")
+                .resolve_local()
+                .unwrap()
+                .name(),
             "golden_env.lint"
         );
         let err = TaskRef::new("golden_env.nope")
-            .resolve()
+            .resolve_local()
             .unwrap_err()
             .to_string();
         assert!(
@@ -1097,5 +1283,189 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(out, "built a");
+    }
+
+    /// A fake TaskService: `versions` lists each task's versions, oldest
+    /// first; `gets` records every GetTaskDetails as "name@version".
+    #[derive(Clone, Default)]
+    struct FakeTasks {
+        versions: Arc<HashMap<String, Vec<String>>>,
+        gets: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    fn fake_spec(name: &str, version: &str) -> TaskSpec {
+        TaskSpec {
+            task_template: Some(crate::idl::TaskTemplate {
+                id: Some(flyteidl2::flyteidl::core::Identifier {
+                    name: name.into(),
+                    version: version.into(),
+                    ..Default::default()
+                }),
+                interface: Some(crate::types::build_typed_interface(
+                    &[("x", <i64 as FlyteType>::literal_type())],
+                    &[("o0", <i64 as FlyteType>::literal_type())],
+                )),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[tonic::async_trait]
+    impl flyteidl2::flyteidl::task::task_service_server::TaskService for FakeTasks {
+        async fn deploy_task(
+            &self,
+            _: tonic::Request<flyteidl2::flyteidl::task::DeployTaskRequest>,
+        ) -> Result<tonic::Response<flyteidl2::flyteidl::task::DeployTaskResponse>, tonic::Status>
+        {
+            Err(tonic::Status::unimplemented("deploy_task"))
+        }
+        async fn get_task_details(
+            &self,
+            req: tonic::Request<flyteidl2::flyteidl::task::GetTaskDetailsRequest>,
+        ) -> Result<tonic::Response<flyteidl2::flyteidl::task::GetTaskDetailsResponse>, tonic::Status>
+        {
+            let id = req.into_inner().task_id.unwrap();
+            self.gets
+                .lock()
+                .unwrap()
+                .push(format!("{}@{}", id.name, id.version));
+            // Concurrent first calls must have time to pile up on one fetch.
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            let known = self
+                .versions
+                .get(&id.name)
+                .is_some_and(|v| v.contains(&id.version));
+            if !known {
+                return Err(tonic::Status::not_found("no such task"));
+            }
+            Ok(tonic::Response::new(
+                flyteidl2::flyteidl::task::GetTaskDetailsResponse {
+                    details: Some(flyteidl2::flyteidl::task::TaskDetails {
+                        spec: Some(fake_spec(&id.name, &id.version)),
+                        ..Default::default()
+                    }),
+                },
+            ))
+        }
+        async fn list_tasks(
+            &self,
+            req: tonic::Request<flyteidl2::flyteidl::task::ListTasksRequest>,
+        ) -> Result<tonic::Response<flyteidl2::flyteidl::task::ListTasksResponse>, tonic::Status>
+        {
+            let req = req.into_inner().request.unwrap();
+            assert_eq!(req.limit, 1);
+            assert_eq!(req.sort_by_fields[0].key, "created_at");
+            let name = &req.filters[0].values[0];
+            let tasks = self
+                .versions
+                .get(name)
+                .and_then(|v| v.last())
+                .map(|version| flyteidl2::flyteidl::task::Task {
+                    task_id: Some(TaskIdentifier {
+                        name: name.clone(),
+                        version: version.clone(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                });
+            Ok(tonic::Response::new(
+                flyteidl2::flyteidl::task::ListTasksResponse {
+                    tasks: tasks.into_iter().collect(),
+                    ..Default::default()
+                },
+            ))
+        }
+        async fn list_versions(
+            &self,
+            _: tonic::Request<flyteidl2::flyteidl::task::ListVersionsRequest>,
+        ) -> Result<tonic::Response<flyteidl2::flyteidl::task::ListVersionsResponse>, tonic::Status>
+        {
+            Err(tonic::Status::unimplemented("list_versions"))
+        }
+    }
+
+    #[test]
+    fn remote_tasks_are_fetched_once_per_version() {
+        let fake = FakeTasks {
+            versions: Arc::new(HashMap::from([
+                (
+                    "rt.sq".to_string(),
+                    vec!["v1".to_string(), "v2".to_string()],
+                ),
+                ("rt.cur".to_string(), vec!["v9".to_string()]),
+            ])),
+            ..Default::default()
+        };
+        let rt = crate::controller::runtime();
+        let listener = rt
+            .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        rt.spawn(
+            tonic::transport::Server::builder()
+                .add_service(
+                    flyteidl2::flyteidl::task::task_service_server::TaskServiceServer::new(
+                        fake.clone(),
+                    ),
+                )
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener)),
+        );
+        let run = RunIdentifier {
+            org: "o".into(),
+            project: "p".into(),
+            domain: "d".into(),
+            name: "r".into(),
+        };
+        let controller = Controller::without_auth(run, format!("http://{addr}"), 1).unwrap();
+        let fetch = |task: TaskRef| {
+            let controller = controller.clone();
+            async move { task.resolve(&controller).await }
+        };
+        let version = |spec: &ResolvedSpec| {
+            let template = spec.spec.task_template.as_ref().unwrap();
+            template.id.as_ref().unwrap().version.clone()
+        };
+
+        rt.block_on(async {
+            // Concurrent first calls share one fetch.
+            let exact = TaskRef::remote("rt.sq", TaskVersion::Exact(Cow::Borrowed("v1")));
+            let specs = futures::future::try_join_all((0..3).map(|_| fetch(exact.clone())))
+                .await
+                .unwrap();
+            assert!(specs.iter().all(|s| Arc::ptr_eq(s, &specs[0])));
+            assert_eq!(version(&specs[0]), "v1");
+            // Hashed like any spec of the same bytes.
+            let direct =
+                ResolvedSpec::decode(&fake_spec("rt.sq", "v1").encode_to_vec(), None).unwrap();
+            assert_eq!(specs[0].identity, direct.identity);
+
+            let latest = fetch(TaskRef::remote("rt.sq", TaskVersion::Latest))
+                .await
+                .unwrap();
+            assert_eq!(version(&latest), "v2");
+            fetch(TaskRef::remote("rt.sq", TaskVersion::Latest))
+                .await
+                .unwrap();
+
+            let current = TaskRef::remote("rt.cur", TaskVersion::Current);
+            let err = fetch(current.clone()).await.unwrap_err().to_string();
+            assert!(err.contains("--version"), "{err}");
+            set_current_version("v9".into());
+            assert_eq!(version(&fetch(current).await.unwrap()), "v9");
+
+            // Not found is the user's error, and is not cached.
+            let missing = TaskRef::remote("rt.sq", TaskVersion::Exact(Cow::Borrowed("v7")));
+            for _ in 0..2 {
+                match fetch(missing.clone()).await.unwrap_err() {
+                    Error::User { code, .. } => assert_eq!(code, "RemoteTaskNotFoundError"),
+                    e => panic!("{e}"),
+                }
+            }
+        });
+        assert_eq!(
+            *fake.gets.lock().unwrap(),
+            ["rt.sq@v1", "rt.sq@v2", "rt.cur@v9", "rt.sq@v7", "rt.sq@v7"]
+        );
     }
 }

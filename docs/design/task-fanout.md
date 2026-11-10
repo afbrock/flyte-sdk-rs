@@ -1,6 +1,6 @@
 # Calling tasks from Rust tasks
 
-Status: Track 1 implemented and run end to end (a Rust parent fanning out to 19 Rust children, demo run ulj7rsm55n8mp92vpqxm); Track 2 designed, not built.
+Status: Track 1 implemented and run end to end (a Rust parent fanning out to 19 Rust children, demo run ulj7rsm55n8mp92vpqxm). Track 2a (reference tasks) implemented and tested against a fake TaskService, not yet on a backend. Track 2b designed, not built.
 
 ## The contract that does not change
 
@@ -19,8 +19,8 @@ is ever rewritten. The pieces:
 | piece | role | stable? |
 |---|---|---|
 | `TaskRef::new(name)` (const), `TaskRef::named(String)` | the call-site handle | yes |
-| `TaskRef::from_spec_bytes`, `TaskRef::from_source` | explicit sources | yes; new constructors are additive |
-| `SpecSource::{Named, Inline}` | where a spec comes from | additive (non_exhaustive) |
+| `TaskRef::from_spec_bytes`, `TaskRef::remote`, `TaskRef::from_source` | explicit sources | yes; new constructors are additive |
+| `SpecSource::{Named, Inline, Remote}` | where a spec comes from | additive (non_exhaustive) |
 | `with_retries`, `with_short_name` | Python's `override()`; identity unchanged | more overrides are additive |
 | `call_task::<O>` with `O: TaskOutput` (`()`, any `FlyteType` as `o0`, `TaskOutputs`) | the call | yes |
 | `inputs!` / `TaskInputs` | named inputs, put in the task's order | yes |
@@ -72,24 +72,32 @@ parent's container args as `--task-specs <base64 JSON>`.
 
 ## Track 2: specs from anywhere
 
-### (a) Reference tasks: fetch a deployed task
+### (a) Reference tasks: fetch a deployed task (done)
 
-New variant `SpecSource::Remote { name, version: VersionSel }`, where `VersionSel`
-is `Exact(String) | Current | Latest`. `Named` never falls back to it: a
-missing `calls=` entry is an error, not a silent fetch of whatever is deployed.
-Fetching is always asked for, with an explicit `TaskRef::remote`.
+`TaskRef::remote(name, TaskVersion)` makes a `SpecSource::Remote(RemoteTask)`,
+where `TaskVersion` is `Exact | Current | Latest`, as in Python's
+`flyte.remote.Task.get(version=, auto_version=)`. `.in_project(project, domain)`
+looks elsewhere than the calling run's project and domain. `Named` never falls
+back to it: a missing `calls=` entry is an error, not a silent fetch of
+whatever is deployed. Fetching is always asked for explicitly.
 
-- Fetch through `flyteidl2` `TaskService.GetTaskDetails` (or `ListTasks` for
-  `Latest`) on the controller's authenticated channel. `flyte_core`'s
-  `bin/try_list_tasks.rs` shows the channel setup. The client belongs behind
-  `controller.rs`, the existing swap boundary.
-- Cache per process by `(name, resolved version)`. Concurrent first calls share
-  one fetch through a `OnceCell` per key.
-- `Current` means the parent's own version. That needs the worker to read
-  `--version`, which it accepts and drops today.
-- Input order: `TaskDetails` has no declared order, so hash in interface order.
-  That matches `_submit_task_ref`, which is what Python does for the same
-  reference.
+- `TaskService.GetTaskDetails`, after `ListTasks` (newest `created_at` first,
+  limit 1) for `Latest`, as Python does. flyte_core keeps its channel private,
+  so `controller.rs` opens a second one to the same endpoint with the same TLS,
+  keepalive and API-key auth, connected lazily on the first fetch.
+- Cached per process by `(org, project, domain, name, version asked for)`, in a
+  `OnceCell` per key, so concurrent first calls share one fetch and a failed
+  fetch is retried by the next call. `Latest` is therefore resolved once per
+  process: one run never mixes versions.
+- `Current` is the parent's own version, which the worker now reads from
+  `--version`.
+- Not found is a user error, `RemoteTaskNotFoundError`, the Python code.
+- Input order: `TaskDetails` has no declared order, so inputs hash in interface
+  order. That matches `_submit_task_ref`, which is what Python does for the
+  same reference.
+- The interface hash comes from re-encoding the fetched spec. As for any
+  re-encoded spec, that is byte-stable unless a `dataclass_type` map has two or
+  more entries.
 - Callees must be deployed first. That is a deploy-ordering problem for the
   launcher, not the SDK.
 

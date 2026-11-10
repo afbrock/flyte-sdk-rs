@@ -6,9 +6,21 @@
 //! changes this file only.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use flyte_controller_base::action::{Action, ActionType};
+use flyte_controller_base::auth::{
+    AuthConfig, AuthLayer, AuthService, ClientCredentialsAuthenticator,
+};
 use flyte_controller_base::core::CoreBaseController;
+use flyteidl2::flyteidl::common::{Filter, ListRequest, ProjectIdentifier, Sort, filter, sort};
+use flyteidl2::flyteidl::task::task_service_client::TaskServiceClient;
+use flyteidl2::flyteidl::task::{
+    GetTaskDetailsRequest, GetTaskDetailsResponse, ListTasksRequest, ListTasksResponse,
+    TaskIdentifier, list_tasks_request,
+};
+use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
+use tower::Layer as _;
 
 use crate::error::{ConditionOutcome, Error};
 use crate::idl::{
@@ -90,7 +102,78 @@ pub struct StartedTask(Action);
 #[derive(Clone)]
 pub struct Controller {
     inner: Arc<CoreBaseController>,
+    tasks: TaskClient,
     run_id: RunIdentifier,
+}
+
+/// TaskService, for fetching deployed tasks. flyte_core keeps its channel to
+/// itself, so this is a second one to the same endpoint, built the same way
+/// (TLS, keepalive, the same API-key auth), and connected on first use.
+#[derive(Clone)]
+enum TaskClient {
+    Plain(TaskServiceClient<Channel>),
+    Authenticated(TaskServiceClient<AuthService<Channel>>),
+}
+
+/// The same ping cadence as flyte_core's channel (vendor/flyte_core/PATCHES.md).
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
+const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(20);
+
+fn lazy_channel(url: &str) -> Result<Channel, Error> {
+    let err = |e: tonic::transport::Error| Error::Controller(format!("endpoint {url}: {e}"));
+    let mut endpoint = Endpoint::from_shared(url.to_string())
+        .map_err(err)?
+        .keep_alive_while_idle(true)
+        .http2_keep_alive_interval(KEEPALIVE_INTERVAL)
+        .keep_alive_timeout(KEEPALIVE_TIMEOUT);
+    if url.starts_with("https://") {
+        endpoint = endpoint
+            .tls_config(ClientTlsConfig::new().with_native_roots())
+            .map_err(err)?;
+    }
+    Ok(endpoint.connect_lazy())
+}
+
+impl TaskClient {
+    fn with_auth() -> Result<Self, Error> {
+        let api_key = std::env::var("_UNION_EAGER_API_KEY")
+            .map_err(|_| Error::Controller("_UNION_EAGER_API_KEY must be set".into()))?;
+        let config = AuthConfig::new_from_api_key(&api_key)
+            .map_err(|e| Error::Controller(format!("auth config: {e:?}")))?;
+        let channel = lazy_channel(&config.endpoint)?;
+        let auth = AuthLayer::new(
+            Arc::new(ClientCredentialsAuthenticator::new(config)),
+            channel.clone(),
+        );
+        Ok(TaskClient::Authenticated(TaskServiceClient::new(
+            auth.layer(channel),
+        )))
+    }
+
+    /// `Ok(None)` when the backend has no such task.
+    async fn get_task_details(
+        &self,
+        req: GetTaskDetailsRequest,
+    ) -> Result<Option<GetTaskDetailsResponse>, Error> {
+        let resp = match self.clone() {
+            TaskClient::Plain(mut c) => c.get_task_details(req).await,
+            TaskClient::Authenticated(mut c) => c.get_task_details(req).await,
+        };
+        match resp {
+            Ok(resp) => Ok(Some(resp.into_inner())),
+            Err(s) if s.code() == tonic::Code::NotFound => Ok(None),
+            Err(s) => Err(Error::Controller(format!("GetTaskDetails failed: {s}"))),
+        }
+    }
+
+    async fn list_tasks(&self, req: ListTasksRequest) -> Result<ListTasksResponse, Error> {
+        match self.clone() {
+            TaskClient::Plain(mut c) => c.list_tasks(req).await,
+            TaskClient::Authenticated(mut c) => c.list_tasks(req).await,
+        }
+        .map(tonic::Response::into_inner)
+        .map_err(|s| Error::Controller(format!("ListTasks failed: {s}")))
+    }
 }
 
 impl Controller {
@@ -99,7 +182,15 @@ impl Controller {
     pub fn with_auth(run_id: RunIdentifier, workers: usize) -> Result<Self, Error> {
         let inner = CoreBaseController::new_with_auth(workers)
             .map_err(|e| Error::Controller(format!("controller init (auth) failed: {e:?}")))?;
-        Ok(Controller { inner, run_id })
+        let tasks = {
+            let _rt = runtime().enter();
+            TaskClient::with_auth()?
+        };
+        Ok(Controller {
+            inner,
+            tasks,
+            run_id,
+        })
     }
 
     /// Unauthenticated endpoint (devbox/local). Same non-async-thread constraint.
@@ -108,9 +199,17 @@ impl Controller {
         endpoint: String,
         workers: usize,
     ) -> Result<Self, Error> {
+        let tasks = {
+            let _rt = runtime().enter();
+            TaskClient::Plain(TaskServiceClient::new(lazy_channel(&endpoint)?))
+        };
         let inner = CoreBaseController::new_without_auth(endpoint, workers)
             .map_err(|e| Error::Controller(format!("controller init failed: {e:?}")))?;
-        Ok(Controller { inner, run_id })
+        Ok(Controller {
+            inner,
+            tasks,
+            run_id,
+        })
     }
 
     pub fn run_id(&self) -> &RunIdentifier {
@@ -134,6 +233,7 @@ impl Controller {
     pub fn for_run(&self, run_id: RunIdentifier) -> Self {
         Controller {
             inner: self.inner.clone(),
+            tasks: self.tasks.clone(),
             run_id,
         }
     }
@@ -351,6 +451,58 @@ impl Controller {
             .cancel_action(&mut action)
             .await
             .map_err(|e| Error::Controller(format!("task cancel failed: {e:?}")))
+    }
+
+    /// The serialized `TaskSpec` of a deployed task -- Python's
+    /// `TaskDetails.get`. `Ok(None)` when no such task (or version) exists.
+    pub async fn deployed_task_spec(&self, id: TaskIdentifier) -> Result<Option<Vec<u8>>, Error> {
+        let req = GetTaskDetailsRequest { task_id: Some(id) };
+        let Some(resp) = self.tasks.get_task_details(req).await? else {
+            return Ok(None);
+        };
+        resp.details
+            .and_then(|d| d.spec)
+            .map(|spec| Some(spec.encode_to_vec()))
+            .ok_or_else(|| Error::Controller("GetTaskDetails returned no spec".into()))
+    }
+
+    /// The most recently created version of a deployed task, as Python's
+    /// `auto_version="latest"` picks it. `Ok(None)` when it has none.
+    pub async fn latest_task_version(
+        &self,
+        org: &str,
+        project: &str,
+        domain: &str,
+        name: &str,
+    ) -> Result<Option<String>, Error> {
+        let req = ListTasksRequest {
+            request: Some(ListRequest {
+                limit: 1,
+                sort_by_fields: vec![Sort {
+                    key: "created_at".into(),
+                    direction: sort::Direction::Descending as i32,
+                }],
+                filters: vec![Filter {
+                    function: filter::Function::Equal as i32,
+                    field: "name".into(),
+                    values: vec![name.into()],
+                }],
+                ..Default::default()
+            }),
+            scope_by: Some(list_tasks_request::ScopeBy::ProjectId(ProjectIdentifier {
+                organization: org.into(),
+                domain: domain.into(),
+                name: project.into(),
+            })),
+            ..Default::default()
+        };
+        let resp = self.tasks.list_tasks(req).await?;
+        Ok(resp
+            .tasks
+            .into_iter()
+            .next()
+            .and_then(|t| t.task_id)
+            .map(|id| id.version))
     }
 
     pub async fn finalize(&self, parent_action_name: &str) {

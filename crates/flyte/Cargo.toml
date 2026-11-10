@@ -37,9 +37,12 @@ tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 futures = "0.3"
 bytes = "1"
+# TaskService client for fetching deployed tasks (TaskRef::remote), on the
+# same tonic/tower as flyte_core.
+tonic = { version = "0.12", features = ["tls", "tls-native-roots"] }
+tower = "0.4"
 
 [dev-dependencies]
 tempfile = "3"
 # watch_reconnect.rs serves fake State/Queue services to the real controller.
-tonic = "0.12"
 tokio-stream = "0.1"

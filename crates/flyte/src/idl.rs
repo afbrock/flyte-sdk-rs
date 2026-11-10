@@ -12,7 +12,7 @@ pub use flyteidl2::flyteidl::core::{
     VariableEntry, VariableMap, container_error, execution_error, literal, literal_type, parameter,
     primitive, scalar,
 };
-pub use flyteidl2::flyteidl::task::{Inputs, NamedLiteral, Outputs, TaskSpec};
+pub use flyteidl2::flyteidl::task::{Inputs, NamedLiteral, Outputs, TaskIdentifier, TaskSpec};
 pub use flyteidl2::flyteidl::workflow::{ConditionAction, ConditionPromptType, ConditionWebhook};
 pub use flyteidl2::google::protobuf::Duration;
 pub use prost::Message;

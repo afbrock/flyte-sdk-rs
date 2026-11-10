@@ -36,7 +36,8 @@ pub use error::{ConditionOutcome, Error};
 pub use flyte_macros::{FlyteStruct, main, task, trace};
 pub use interface::{TaskInterface, TaskVariable};
 pub use task_ref::{
-    SpecSource, StubInputs, TaskInputs, TaskOutput, TaskOutputs, TaskRef, call_task, stub_task,
+    RemoteTask, SpecSource, StubInputs, TaskInputs, TaskOutput, TaskOutputs, TaskRef, TaskVersion,
+    call_task, stub_task,
 };
 pub use types::FlyteType;
 pub use worker::{TaskEntry, run, worker_main};

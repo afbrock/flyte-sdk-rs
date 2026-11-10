@@ -85,10 +85,15 @@ pub fn parse_args(args: impl Iterator<Item = String>) -> WorkerConfig {
                     tracing::error!("--task-specs: {e}");
                 }
             }
+            // For calls to TaskRef::remote(.., TaskVersion::Current).
+            "--version" => {
+                if let Some(version) = take_value() {
+                    crate::task_ref::set_current_version(version);
+                }
+            }
             // Known flags we accept but don't use in v0.
-            "--version" | "--raw-data-path" | "--checkpoint-path" | "--prev-checkpoint"
-            | "--run-start-time" | "--image-cache" | "--tgz" | "--pkl" | "--dest"
-            | "--interface" => {
+            "--raw-data-path" | "--checkpoint-path" | "--prev-checkpoint" | "--run-start-time"
+            | "--image-cache" | "--tgz" | "--pkl" | "--dest" | "--interface" => {
                 let _ = args.next();
             }
             // Resolver args are a Python-ism; everything after is theirs.
